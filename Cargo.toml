@@ -1,0 +1,11 @@
+[package]
+name = "srp"
+version = "0.1.0"
+edition = "2021"
+description = "Search and replace across files using regex"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+walkdir = "2"
+colored = "2"
