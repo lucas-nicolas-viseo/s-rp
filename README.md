@@ -13,7 +13,15 @@ It is built for quick repo-wide edits with a safer preview mode:
 
 ## Installation
 
-### Build from source
+### Run from source
+
+You can run the tool directly from the project directory without installing it globally:
+
+```bash
+cargo run -- <PATTERN> <REPLACEMENT> [PATH]
+```
+
+### Build the binary locally
 
 ```bash
 cargo build --release
@@ -25,10 +33,24 @@ The binary will be available at:
 target/release/srp
 ```
 
-You can also run it directly without installing:
+Run it directly with:
 
 ```bash
-cargo run -- <PATTERN> <REPLACEMENT> [PATH]
+./target/release/srp <PATTERN> <REPLACEMENT> [PATH]
+```
+
+### Install `srp` as a shell command
+
+If you want `srp` available on your `PATH` as a normal command, install it with Cargo:
+
+```bash
+cargo install --path .
+```
+
+After that, you can run:
+
+```bash
+srp --help
 ```
 
 ## Usage
