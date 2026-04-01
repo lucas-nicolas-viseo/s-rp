@@ -1,12 +1,16 @@
 use clap::Parser;
 use colored::Colorize;
 use regex::Regex;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use std::process::{Command, ExitStatus};
 
 #[derive(Parser)]
-#[command(name = "srp", about = "Search and replace across files using regex")]
+#[command(
+    name = "srp",
+    about = "Search and replace across files using ripgrep-backed search"
+)]
 struct Cli {
     /// Regex pattern to search for
     pattern: String,
@@ -35,66 +39,10 @@ struct Cli {
     glob: Option<String>,
 }
 
-fn should_skip_hidden(entry: &walkdir::DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| s.starts_with('.'))
-        .unwrap_or(false)
-}
-
-fn matches_extension(path: &std::path::Path, extensions: &[String]) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| extensions.iter().any(|e| e == ext))
-        .unwrap_or(false)
-}
-
-fn matches_glob(path: &std::path::Path, pattern: &str) -> bool {
-    // Simple glob: just check if filename matches
-    let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    glob_match(pattern, file_name)
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut p = pattern.chars().peekable();
-    let mut t = text.chars().peekable();
-
-    while p.peek().is_some() {
-        match p.peek() {
-            Some('*') => {
-                p.next();
-                if p.peek().is_none() {
-                    return true;
-                }
-                while t.peek().is_some() {
-                    let remaining_pattern: String = p.clone().collect();
-                    let remaining_text: String = t.clone().collect();
-                    if glob_match(&remaining_pattern, &remaining_text) {
-                        return true;
-                    }
-                    t.next();
-                }
-                return false;
-            }
-            Some('?') => {
-                p.next();
-                if t.next().is_none() {
-                    return false;
-                }
-            }
-            Some(&pc) => {
-                p.next();
-                match t.next() {
-                    Some(tc) if tc == pc => {}
-                    _ => return false,
-                }
-            }
-            None => break,
-        }
-    }
-
-    t.peek().is_none()
+struct CommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 fn main() {
@@ -103,110 +51,230 @@ fn main() {
     let re = match Regex::new(&cli.pattern) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{} invalid regex '{}': {}", "error:".red().bold(), cli.pattern, e);
+            eprintln!(
+                "{} invalid regex '{}': {}",
+                "error:".red().bold(),
+                cli.pattern,
+                e
+            );
             std::process::exit(1);
         }
     };
 
-    let walker = WalkDir::new(&cli.path).into_iter().filter_entry(|e| {
-        if cli.hidden {
-            true
-        } else {
-            !should_skip_hidden(e) || e.depth() == 0
+    ensure_ripgrep_available();
+
+    let matched_files = match matched_files(&cli) {
+        Ok(files) => files,
+        Err(message) => {
+            eprintln!("{} {}", "error:".red().bold(), message);
+            std::process::exit(1);
         }
-    });
+    };
 
-    let mut matched_files = 0;
-    let mut total_replacements = 0;
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
+    if cli.dry_run {
+        if let Err(message) = run_dry_run(&cli, &re, &matched_files) {
+            eprintln!("{} {}", "error:".red().bold(), message);
+            std::process::exit(1);
         }
+    } else {
+        run_replace(&cli, &re, &matched_files);
+    }
+}
 
-        let path = entry.path();
-
-        // Filter by extension
-        if let Some(ref exts) = cli.file_type {
-            if !matches_extension(path, exts) {
-                continue;
-            }
-        }
-
-        // Filter by glob
-        if let Some(ref glob_pat) = cli.glob {
-            if !matches_glob(path, glob_pat) {
-                continue;
-            }
-        }
-
-        // Read file, skip binary
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        if !re.is_match(&content) {
-            continue;
-        }
-
-        matched_files += 1;
-
-        if cli.dry_run {
-            println!("  {}", path.display().to_string().cyan());
-            for (i, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    let line_num = format!("{:>4}", i + 1);
-                    let highlighted = re.replace_all(line, |caps: &regex::Captures| {
-                        format!("{}", caps[0].red().bold())
-                    });
-                    println!("    {} {}", line_num.dimmed(), highlighted);
-                    total_replacements += re.find_iter(line).count();
-                }
-            }
-        } else {
-            let new_content = re.replace_all(&content, cli.replacement.as_str());
-            let count: usize = re.find_iter(&content).count();
-            total_replacements += count;
-
-            if let Err(e) = fs::write(path, new_content.as_ref()) {
-                eprintln!("{} writing {}: {}", "error:".red().bold(), path.display(), e);
-                continue;
-            }
-            println!(
-                "  {} {} ({})",
-                "replaced".green(),
-                path.display(),
-                format!("{count} match{}", if count == 1 { "" } else { "es" }).dimmed()
+fn ensure_ripgrep_available() {
+    match Command::new("rg").arg("--version").output() {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            eprintln!(
+                "{} ripgrep ('rg') is installed but could not be executed successfully",
+                "error:".red().bold()
             );
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!(
+                "{} ripgrep ('rg') is required but was not found: {}",
+                "error:".red().bold(),
+                err
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn rg_base_args(cli: &Cli) -> Vec<String> {
+    let mut args = vec!["--with-filename".to_string(), "--line-number".to_string()];
+
+    if cli.hidden {
+        args.push("--hidden".to_string());
+    }
+
+    if let Some(ref exts) = cli.file_type {
+        for ext in exts {
+            let normalized = ext.trim_start_matches('.');
+            args.push("--glob".to_string());
+            args.push(format!("*.{normalized}"));
         }
     }
 
-    // Summary
+    if let Some(ref glob) = cli.glob {
+        args.push("--glob".to_string());
+        args.push(glob.clone());
+    }
+
+    args
+}
+
+fn run_rg<I, S>(args: I) -> Result<CommandOutput, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new("rg")
+        .args(args)
+        .output()
+        .map(|output| CommandOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+        .map_err(|err| format!("failed to execute rg: {err}"))
+}
+
+fn matched_files(cli: &Cli) -> Result<Vec<PathBuf>, String> {
+    let mut args = rg_base_args(cli);
+    args.push("--files-with-matches".to_string());
+    args.push("--null".to_string());
+    args.push(cli.pattern.clone());
+    args.push(cli.path.display().to_string());
+
+    let output = run_rg(args)?;
+
+    match output.status.code() {
+        Some(0) => {
+            let files = output
+                .stdout
+                .split(|byte| *byte == b'\0')
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| PathBuf::from(String::from_utf8_lossy(chunk).into_owned()))
+                .collect();
+            Ok(files)
+        }
+        Some(1) => Ok(Vec::new()),
+        _ => Err(rg_error_message(output.stderr)),
+    }
+}
+
+fn run_dry_run(cli: &Cli, re: &Regex, files: &[PathBuf]) -> Result<(), String> {
+    let mut args = rg_base_args(cli);
+    args.push("--color=always".to_string());
+    args.push(cli.pattern.clone());
+    args.push(cli.path.display().to_string());
+
+    let output = run_rg(args)?;
+
+    match output.status.code() {
+        Some(0) => {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        Some(1) => {}
+        _ => return Err(rg_error_message(output.stderr)),
+    }
+
+    let total_matches = count_matches(files, re);
+
     println!();
-    if cli.dry_run {
+    if files.is_empty() {
+        println!("{}", "no matches found".dimmed());
+    } else {
         println!(
             "{} {} match{} in {} file{}",
             "dry run:".yellow().bold(),
-            total_replacements,
-            if total_replacements == 1 { "" } else { "es" },
-            matched_files,
-            if matched_files == 1 { "" } else { "s" },
+            total_matches,
+            if total_matches == 1 { "" } else { "es" },
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
         );
+        println!("  run without {} to apply", "--dry-run".bold());
+    }
+
+    Ok(())
+}
+
+fn run_replace(cli: &Cli, re: &Regex, files: &[PathBuf]) {
+    let mut total_replacements = 0;
+    let mut modified_files = 0;
+
+    for path in files {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!(
+                    "{} reading {}: {}",
+                    "error:".red().bold(),
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        let count = re.find_iter(&content).count();
+        if count == 0 {
+            continue;
+        }
+
+        let new_content = re.replace_all(&content, cli.replacement.as_str());
+        if let Err(err) = fs::write(path, new_content.as_ref()) {
+            eprintln!(
+                "{} writing {}: {}",
+                "error:".red().bold(),
+                path.display(),
+                err
+            );
+            continue;
+        }
+
+        modified_files += 1;
+        total_replacements += count;
+
         println!(
-            "  run without {} to apply",
-            "--dry-run".bold()
+            "  {} {} ({})",
+            "replaced".green(),
+            path.display(),
+            format!("{count} match{}", if count == 1 { "" } else { "es" }).dimmed()
         );
-    } else if matched_files > 0 {
+    }
+
+    println!();
+    if modified_files > 0 {
         println!(
             "{} {} replacement{} in {} file{}",
             "done:".green().bold(),
             total_replacements,
             if total_replacements == 1 { "" } else { "s" },
-            matched_files,
-            if matched_files == 1 { "" } else { "s" },
+            modified_files,
+            if modified_files == 1 { "" } else { "s" },
         );
     } else {
         println!("{}", "no matches found".dimmed());
+    }
+}
+
+fn count_matches(files: &[PathBuf], re: &Regex) -> usize {
+    files
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .map(|content| re.find_iter(&content).count())
+        .sum()
+}
+
+fn rg_error_message(stderr: Vec<u8>) -> String {
+    let stderr = String::from_utf8_lossy(&stderr);
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "rg failed".to_string()
+    } else {
+        trimmed.to_string()
     }
 }

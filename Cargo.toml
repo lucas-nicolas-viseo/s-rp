@@ -7,5 +7,4 @@ description = "Search and replace across files using regex"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-walkdir = "2"
 colored = "2"

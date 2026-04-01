@@ -2,14 +2,16 @@
 
 `srp` is a small Rust command-line tool for recursive search and replace across files using regular expressions.
 
+It is built as a convenient wrapper around `ripgrep` for fast matching and file selection, while keeping replacement logic simple in Rust.
+
 It is built for quick repo-wide edits with a safer preview mode:
 
-- Recursive directory traversal
+- Ripgrep-backed search
 - Regex search patterns
 - In-place replacement
 - Dry-run output with highlighted matches
-- Optional hidden-file inclusion
-- Optional extension and glob-style filtering
+- Hidden-file support via ripgrep
+- Extension and glob filtering via ripgrep
 
 ## Installation
 
@@ -53,6 +55,16 @@ After that, you can run:
 srp --help
 ```
 
+### Runtime dependency
+
+`srp` shells out to `ripgrep`, so `rg` must also be installed and available on your `PATH`.
+
+Check with:
+
+```bash
+rg --version
+```
+
 ## Usage
 
 ```bash
@@ -70,7 +82,7 @@ srp [OPTIONS] <PATTERN> <REPLACEMENT> [PATH]
 - `-n`, `--dry-run`: show matching lines without modifying files
 - `--hidden`: include hidden files and hidden directories
 - `-t`, `--type <EXT>`: only process files with the given extension
-- `-g`, `--glob <GLOB>`: only process files whose file name matches a simple glob
+- `-g`, `--glob <GLOB>`: only process files matching a ripgrep glob
 - `-h`, `--help`: print CLI help
 
 ## Examples
@@ -119,15 +131,15 @@ srp --dry-run "fn ([a-z_]+)" "pub fn $1" ./src
 srp -g "*.rs" "println!" "eprintln!" .
 ```
 
-Important: the current implementation matches the glob against the file name only, not the full path. For example, `*.rs` works, but `src/**/*.rs` does not behave like a full path-aware glob engine.
+Because filtering is delegated to ripgrep, full ripgrep glob semantics apply. Patterns like `*.rs` and `src/**/*.rs` work as expected.
 
 ## Behavior Notes
 
 ### What gets processed
 
-- `srp` walks the target directory recursively with `walkdir`
-- Only regular files are considered
-- Files are read with `fs::read_to_string`
+- `srp` asks `rg` to find matching files quickly
+- `rg` handles recursive traversal, ignore rules, hidden-file behavior, and glob filtering
+- Matching files are then read with `fs::read_to_string`
 - If a file cannot be decoded as UTF-8, it is skipped
 - If reading or writing fails, the tool continues with the remaining files
 
@@ -137,9 +149,8 @@ In practice, that means `srp` is intended for text files, not binary files.
 
 With `--dry-run`, the tool:
 
-- prints each matching file path
-- prints each matching line with its line number
-- highlights the matched substring
+- delegates preview output to `rg`
+- prints matching file paths and matching lines with ripgrep's formatting
 - reports a final summary of total matches and matched files
 
 No files are modified in dry-run mode.
@@ -157,11 +168,10 @@ Without `--dry-run`, the tool:
 
 These are current implementation details, not just documentation caveats:
 
-- `--glob` is a minimal custom matcher, not a full glob implementation
-- `--glob` checks only the file name, not the relative path
+- `rg` must be installed and available on `PATH`
 - Matching is done on whole-file UTF-8 strings, so binary files are skipped
 - There is no interactive confirmation or backup creation
-- There is no ignore-file support such as `.gitignore`
+- Replacement is still performed in Rust after ripgrep identifies candidate files
 
 For large or risky replacements, run `--dry-run` first.
 
@@ -179,48 +189,50 @@ The `Cli` struct uses `clap::Parser` to define:
 
 This is the entry point for the command-line interface.
 
-### Traversal
+### Ripgrep integration
 
-`WalkDir::new(&cli.path)` recursively visits the target directory.
+The core change is that `srp` now shells out to `rg` for search and file discovery.
 
-Hidden-file behavior is controlled by `filter_entry(...)` and `should_skip_hidden(...)`:
+The helper functions build ripgrep arguments from the CLI flags:
 
-- with `--hidden`, everything is traversed
-- otherwise, entries beginning with `.` are skipped, except for the root path itself
+- `--hidden` is passed through to `rg`
+- each `-t/--type` becomes a `--glob "*.ext"` filter
+- `-g/--glob` is passed through directly
+- the search path is forwarded as the final positional argument
 
-### Filtering
+This means ignore handling and path matching come from ripgrep rather than custom traversal logic.
 
-After traversal, the tool applies two optional filters:
+### Candidate file discovery
 
-- `matches_extension(...)` checks `path.extension()`
-- `matches_glob(...)` checks the file name against a custom `glob_match(...)` function
+`matched_files(...)` runs ripgrep with `--files-with-matches --null` to retrieve the list of files containing at least one match.
 
-The glob matcher supports:
-
-- `*` for any sequence of characters
-- `?` for a single character
-
-It does not implement path-aware glob semantics.
+That file list is the bridge between the fast search phase and the Rust replacement phase.
 
 ### Regex compilation and error handling
 
-The regex is compiled once at startup:
+The regex is still compiled once in Rust:
 
 ```rust
 let re = Regex::new(&cli.pattern)
 ```
 
-If the pattern is invalid, the tool prints a colored error and exits with status code `1`.
+This validates the pattern before replacement and is also used to count replacements in summaries.
+
+The program also checks that `rg` is available before doing any work.
 
 ### Match preview
 
-In dry-run mode, each line is checked with `re.is_match(line)`. Matching substrings are highlighted by calling `re.replace_all(...)` with a closure that wraps each match in colored terminal output.
+In dry-run mode, `srp` lets ripgrep print the preview output directly:
 
-The tool also counts matches with `re.find_iter(...)`.
+```rust
+rg --color=always --line-number ...
+```
+
+This keeps preview behavior fast and aligned with ripgrep's match engine. The Rust side then computes the summary by reading only the matched files and counting matches with `re.find_iter(...)`.
 
 ### In-place replacement
 
-In replace mode, the full file content is transformed with:
+In replace mode, each matched file is read and transformed with:
 
 ```rust
 re.replace_all(&content, cli.replacement.as_str())
@@ -228,7 +240,7 @@ re.replace_all(&content, cli.replacement.as_str())
 
 The resulting text is then written back with `fs::write(...)`.
 
-This keeps the implementation simple, but it means the full file is loaded into memory.
+This keeps the write path simple, but it means each matched file is loaded fully into memory before being rewritten.
 
 ## Dependencies
 
@@ -236,8 +248,9 @@ Defined in [`Cargo.toml`](/Users/lucas.nicolas/tools/srp/Cargo.toml):
 
 - `clap`: argument parsing
 - `regex`: pattern matching and replacement
-- `walkdir`: recursive traversal
 - `colored`: colored terminal output
+
+`ripgrep` is an external runtime dependency rather than a Rust crate dependency.
 
 ## Typical Workflow
 
